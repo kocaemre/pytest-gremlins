@@ -20,6 +20,7 @@ import difflib
 from enum import Enum
 import functools
 import importlib.util
+import inspect
 import json
 import logging
 import os
@@ -75,6 +76,11 @@ from pytest_gremlins.coverage import (
 from pytest_gremlins.coverage.context_plugin import GremlinContextPlugin
 from pytest_gremlins.coverage.nodeid_markers import strip_marker_suffix
 from pytest_gremlins.gremlins_options import addopts_without_gremlins
+from pytest_gremlins.instrumentation import origin_finder
+from pytest_gremlins.instrumentation.origin_finder import (
+    file_identity,
+    normalize_origin,
+)
 from pytest_gremlins.instrumentation.switcher import ACTIVE_GREMLIN_ENV_VAR
 from pytest_gremlins.instrumentation.transformer import (
     get_default_registry,
@@ -1251,7 +1257,9 @@ def _generate_gremlins(
     all_gremlins: list[Gremlin] = []
     instrumented_asts: dict[str, ast.Module] = {}
 
-    for file_path, source in source_files.items():
+    targets, duplicates = _without_duplicate_origins(source_files, rootdir)
+    for file_path in targets:
+        source = source_files[file_path]
         try:
             gremlins, instrumented_tree = transform_source(source, file_path, gremlin_session.operators)
         except Exception:
@@ -1263,8 +1271,52 @@ def _generate_gremlins(
     gremlin_session.gremlins = all_gremlins
 
     if all_gremlins:
-        instrumented_dir = _write_instrumented_sources(instrumented_asts, rootdir)
+        instrumented_dir = _write_instrumented_sources(instrumented_asts, rootdir, duplicates)
         gremlin_session.instrumented_dir = instrumented_dir
+
+
+def _spelling_rank(file_path: str, rootdir: Path) -> tuple[bool, str]:
+    """Rank a target so that a real file outranks a symlink to it, then by path."""
+    origin = (rootdir / file_path).absolute()
+    return (str(origin) != os.path.realpath(origin), file_path)
+
+
+def _without_duplicate_origins(source_files: dict[str, str], rootdir: Path) -> tuple[list[str], dict[str, list[str]]]:
+    """Return the targets in a stable order with each file on disk listed once.
+
+    The finder in the test subprocess matches a file by where it really is, so two targets that are one
+    file (a symlink, a hard link) can only be served one instrumented source: the loser's gremlins would
+    never activate and be reported as survivors. A loser is dropped before it generates gremlins, and the
+    drop is logged with the file it duplicates.
+
+    Args:
+        source_files: Mapping of target paths to their source code.
+        rootdir: Root directory of the project; a relative path is taken from it.
+
+    Returns:
+        The target paths to instrument, real files first, then in path order, and for each of them the
+        other spellings of the same file that were dropped.
+    """
+    kept: list[str] = []
+    duplicates: dict[str, list[str]] = {}
+    first_seen: dict[str, str] = {}
+    for file_path in sorted(source_files, key=lambda path: _spelling_rank(path, rootdir)):
+        origin = str((rootdir / file_path).absolute())
+        identity = file_identity(origin) or normalize_origin(origin)
+        if identity in first_seen:
+            logger.warning(
+                'Skipping %s as a mutation target: it is the same file on disk as %s, '
+                'so its gremlins are generated once under that path and stay active when imported through either. '
+                'List only one of them in the gremlin targets to silence this warning',
+                file_path,
+                first_seen[identity],
+            )
+            duplicates[first_seen[identity]].append(file_path)
+            continue
+        first_seen[identity] = file_path
+        duplicates[file_path] = []
+        kept.append(file_path)
+    return kept, duplicates
 
 
 def _discover_source_files(
@@ -1434,13 +1486,17 @@ def _add_source_file(path: Path, source_files: dict[str, str]) -> None:
 def _write_instrumented_sources(
     instrumented_asts: dict[str, ast.Module],
     rootdir: Path,
+    duplicates: dict[str, list[str]] | None = None,
 ) -> Path:
     """Write instrumented sources to a JSON file for import hook injection.
 
     Creates a temporary directory containing:
-    1. A JSON file mapping module names to their instrumented source code
-       and the path of the file that source came from. A package ``__init__.py``
-       also records ``package_dir`` so the finder can serve it as a package.
+    1. A JSON file mapping the normalized real path of each instrumented file to its
+       instrumented source code, the path that source came from, the file's device and
+       inode (``identity``, for spellings the path key misses) and the lowercased file
+       names it may be imported as (``names``, so the finder skips every other import
+       without touching the disk). No module name is recorded: the finder in the
+       subprocess serves a file under whatever name the import system resolves to it.
     2. A bootstrap script that registers import hooks and runs pytest
 
     This approach ensures that import hooks are registered BEFORE any modules
@@ -1449,7 +1505,9 @@ def _write_instrumented_sources(
 
     Args:
         instrumented_asts: Mapping of original file paths to their instrumented ASTs.
-        rootdir: Root directory of the project.
+        rootdir: Root directory of the project; a relative path is taken from it.
+        duplicates: For a path in ``instrumented_asts``, the other spellings of the same file that
+            were dropped as targets; imported through one of them, the file is still served.
 
     Returns:
         Path to the temporary directory containing the bootstrap infrastructure.
@@ -1463,27 +1521,17 @@ del _gremlin_os
 
     injection_nodes = ast.parse(gremlin_active_injection).body
 
-    instrumented_sources: dict[str, dict[str, str]] = {}
-    for original_path, tree in _package_inits_first(instrumented_asts, rootdir):
-        module_name = _path_to_module_name(Path(original_path), rootdir)
-        if module_name in instrumented_sources:
-            logger.warning(
-                'Module name %r is taken by the package %s; %s is shadowed by it and can never be imported, '
-                'so its gremlins cannot be killed.',
-                module_name,
-                instrumented_sources[module_name]['origin'],
-                original_path,
-            )
-            continue
+    instrumented_sources: origin_finder.InstrumentedSources = {}
+    for original_path, tree in instrumented_asts.items():
+        origin = (rootdir / original_path).absolute()
         injected_body = _prepend_injection(tree.body, injection_nodes)
-        origin = Path(original_path).absolute()
-        entry = {
+        spellings = [str(origin), os.path.realpath(origin), *(duplicates or {}).get(original_path, [])]
+        instrumented_sources[normalize_origin(str(origin))] = {
             'source': ast.unparse(ast.Module(body=injected_body, type_ignores=tree.type_ignores)),
             'origin': str(origin),
+            'identity': file_identity(str(origin)),
+            'file_names': sorted({Path(spelling).name.lower() for spelling in spellings}),
         }
-        if _is_package_init(origin, module_name):
-            entry['package_dir'] = str(origin.parent)
-        instrumented_sources[module_name] = entry
 
     sources_file = temp_dir / 'sources.json'
     sources_file.write_text(json.dumps(instrumented_sources))
@@ -1539,63 +1587,6 @@ def _prepend_injection(body: list[ast.stmt], injection_nodes: list[ast.stmt]) ->
     return body[:insert_position] + injection_nodes + body[insert_position:]
 
 
-_PACKAGE_INIT_STEM = '__init__'
-
-
-def _path_to_module_name(file_path: Path, rootdir: Path) -> str:
-    """Convert a file path to a Python module name.
-
-    Args:
-        file_path: Path to the Python file.
-        rootdir: Root directory of the project.
-
-    Returns:
-        The module name (e.g., 'package.module' for 'package/module.py').
-        For src/ layout projects, the 'src' prefix is stripped since it's
-        a layout convention, not part of the import path.
-        A package ``__init__.py`` is named after its package ('package' for
-        'package/__init__.py'), because that is the name Python imports it under.
-        An ``__init__.py`` sitting directly in the root (or in ``src/``) belongs
-        to no importable package, so it keeps the literal name ``__init__``.
-    """
-    try:
-        relative = file_path.relative_to(rootdir)
-    except ValueError:
-        relative = Path(file_path.name)
-
-    parts = list(relative.with_suffix('').parts)
-
-    # Strip 'src' prefix for src/ layout projects.
-    # Python imports use 'mypackage.module', not 'src.mypackage.module'.
-    if parts and parts[0] == 'src':
-        parts = parts[1:]
-
-    if len(parts) > 1 and parts[-1] == _PACKAGE_INIT_STEM:
-        parts = parts[:-1]
-
-    return '.'.join(parts)
-
-
-def _package_inits_first(
-    instrumented_asts: dict[str, ast.Module],
-    rootdir: Path,
-) -> list[tuple[str, ast.Module]]:
-    """Order modules so a package ``__init__.py`` precedes any plain module that shares its name.
-
-    Python imports the package when both ``pkg/__init__.py`` and ``pkg.py`` exist, so the package must own
-    the name in ``sources.json`` whatever order the targets were given in.
-    """
-    return sorted(
-        instrumented_asts.items(),
-        key=lambda item: not _is_package_init(Path(item[0]), _path_to_module_name(Path(item[0]), rootdir)),
-    )
-
-
-def _is_package_init(file_path: Path, module_name: str) -> bool:
-    """Return whether ``file_path`` is the ``__init__.py`` that ``module_name`` names as a package."""
-    return file_path.stem == _PACKAGE_INIT_STEM and file_path.suffix == '.py' and module_name != _PACKAGE_INIT_STEM
-
-
 def _get_bootstrap_script() -> str:
     """Return the bootstrap script that registers import hooks and runs pytest.
 
@@ -1624,8 +1615,8 @@ instrumented code with mutation switching logic, then runs pytest.
 import json
 import os
 import sys
-from importlib.abc import Loader, MetaPathFinder
-from importlib.machinery import ModuleSpec
+
+__ORIGIN_FINDER_SOURCE__
 
 
 def main():
@@ -1637,39 +1628,8 @@ def main():
     with open(sources_file, encoding='utf-8') as f:
         instrumented_sources = json.load(f)
 
-    # Get exec function - use indirect access to satisfy linters
-    # This is the standard pattern for import loaders (see importlib docs)
-    run_code = getattr(__builtins__, 'exec', None) or __builtins__.get('exec')
-
-    class GremlinLoader(Loader):
-        def __init__(self, source, module_name):
-            self._source = source
-            self._module_name = module_name
-
-        def create_module(self, spec):
-            return None
-
-        def exec_module(self, module):
-            # Compile and execute the instrumented source in the module's namespace.
-            # The code comes from our AST transformation, not untrusted input.
-            code = compile(self._source, self._module_name, 'exec')
-            run_code(code, module.__dict__)
-
-    class GremlinFinder(MetaPathFinder):
-        def find_spec(self, fullname, path, target=None):
-            entry = instrumented_sources.get(fullname)
-            if entry is None:
-                return None
-            loader = GremlinLoader(entry['source'], fullname)
-            package_dir = entry.get('package_dir')
-            spec = ModuleSpec(fullname, loader, origin=entry['origin'], is_package=package_dir is not None)
-            if package_dir is not None:
-                spec.submodule_search_locations = [package_dir]
-            spec.has_location = True
-            return spec
-
-    # Register finder at the START of meta_path
-    sys.meta_path.insert(0, GremlinFinder())
+    # Serve each instrumented file under whatever name the import system resolves it to.
+    install(instrumented_sources)
 
     # Now run pytest with remaining arguments
     import pytest
@@ -1718,8 +1678,10 @@ def main():
 if __name__ == '__main__':
     main()
 """
-    return script.replace('__COLLECTION_FAILED_EXIT_CODE__', str(GREMLIN_COLLECTION_FAILED_EXIT_CODE)).replace(
-        '__UNATTRIBUTABLE_MARKER__', UNATTRIBUTABLE_MARKER
+    return (
+        script.replace('__COLLECTION_FAILED_EXIT_CODE__', str(GREMLIN_COLLECTION_FAILED_EXIT_CODE))
+        .replace('__UNATTRIBUTABLE_MARKER__', UNATTRIBUTABLE_MARKER)
+        .replace('__ORIGIN_FINDER_SOURCE__', inspect.getsource(origin_finder))
     )
 
 
@@ -1754,6 +1716,8 @@ import sys
 import traceback
 import unittest
 
+__ORIGIN_FINDER_SOURCE__
+
 
 def setup_import_hooks():
     """Register the gremlin import hooks from sources.json."""
@@ -1764,37 +1728,7 @@ def setup_import_hooks():
     with open(sources_file, encoding='utf-8') as f:
         instrumented_sources = json.load(f)
 
-    run_code = getattr(__builtins__, 'exec', None) or __builtins__.get('exec')
-
-    from importlib.abc import Loader, MetaPathFinder
-    from importlib.machinery import ModuleSpec
-
-    class GremlinLoader(Loader):
-        def __init__(self, source, module_name):
-            self._source = source
-            self._module_name = module_name
-
-        def create_module(self, spec):
-            return None
-
-        def exec_module(self, module):
-            code = compile(self._source, self._module_name, 'exec')
-            run_code(code, module.__dict__)
-
-    class GremlinFinder(MetaPathFinder):
-        def find_spec(self, fullname, path, target=None):
-            entry = instrumented_sources.get(fullname)
-            if entry is None:
-                return None
-            loader = GremlinLoader(entry['source'], fullname)
-            package_dir = entry.get('package_dir')
-            spec = ModuleSpec(fullname, loader, origin=entry['origin'], is_package=package_dir is not None)
-            if package_dir is not None:
-                spec.submodule_search_locations = [package_dir]
-            spec.has_location = True
-            return spec
-
-    sys.meta_path.insert(0, GremlinFinder())
+    install(instrumented_sources)
 
 
 def load_test_module(file_path):
@@ -1960,7 +1894,9 @@ def guarded_main():
 if __name__ == '__main__':
     guarded_main()
 '''
-    return script.replace('__CANNOT_VERIFY_EXIT_CODE__', str(LIGHTWEIGHT_CANNOT_VERIFY_EXIT_CODE))
+    return script.replace('__CANNOT_VERIFY_EXIT_CODE__', str(LIGHTWEIGHT_CANNOT_VERIFY_EXIT_CODE)).replace(
+        '__ORIGIN_FINDER_SOURCE__', inspect.getsource(origin_finder)
+    )
 
 
 def _cleanup_instrumented_dir(instrumented_dir: Path | None) -> None:

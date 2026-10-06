@@ -18,6 +18,7 @@ from _pytest.outcomes import Exit
 import pytest
 
 from pytest_gremlins.coverage.prioritized_selector import PrioritizedSelector
+from pytest_gremlins.instrumentation.transformer import get_default_registry
 from pytest_gremlins.plugin import (
     GremlinSession,
     _add_source_file,
@@ -33,7 +34,6 @@ from pytest_gremlins.plugin import (
     _is_xdist_worker,
     _make_node_ids_relative,
     _parse_cli_report_formats,
-    _path_to_module_name,
     _pytest_cov_available,
     _read_parallel_config,
     _select_tests_for_gremlin_prioritized,
@@ -338,42 +338,6 @@ class DescribeMakeNodeIdsRelative:
         result = _make_node_ids_relative(node_ids, rootdir)
 
         assert result == ['/some/other/path/test.py::test_func']
-
-
-@pytest.mark.small
-class DescribePathToModuleName:
-    """Tests for _path_to_module_name function."""
-
-    def it_converts_relative_path_to_module(self, tmp_path: Path) -> None:
-        """Converts relative path to module name."""
-        file_path = tmp_path / 'package' / 'module.py'
-        result = _path_to_module_name(file_path, tmp_path)
-        assert result == 'package.module'
-
-    def it_strips_src_prefix(self, tmp_path: Path) -> None:
-        """Strips src/ prefix from path since it's a layout convention."""
-        file_path = tmp_path / 'src' / 'mypackage' / 'module.py'
-        result = _path_to_module_name(file_path, tmp_path)
-        assert result == 'mypackage.module'
-
-
-@pytest.mark.medium
-class DescribePathToModuleNameFileIO:
-    """Filesystem tests for _path_to_module_name — require real directory creation."""
-
-    def it_handles_file_not_relative_to_rootdir(self, tmp_path: Path) -> None:
-        """When file is not under rootdir, uses just the filename.
-
-        Covers lines 426-427: ValueError catch for relative_to.
-        """
-        rootdir = tmp_path / 'project'
-        rootdir.mkdir()
-        file_path = Path('/some/other/path/module.py')
-
-        result = _path_to_module_name(file_path, rootdir)
-
-        # Just returns the filename without .py extension
-        assert result == 'module'
 
 
 @pytest.mark.small
@@ -902,6 +866,89 @@ class DescribeGenerateGremlins:
         assert gs.gremlins == []
         # Exception is logged (logger.exception emits at ERROR level).
         assert any('Failed to transform bad_file.py' in r.message for r in caplog.records)
+
+
+def _session() -> GremlinSession:
+    return GremlinSession(enabled=True, operators=get_default_registry().get_all())
+
+
+@pytest.mark.medium
+class DescribeGenerateGremlinsDuplicateOrigins:
+    """Two targets that are one file on disk produce gremlins once, so none can falsely survive (#597)."""
+
+    _SOURCE = 'def positive(n):\n    return n > 0\n'
+
+    def _targets(self, tmp_path: Path) -> dict[str, str]:
+        core = tmp_path / 'core.py'
+        core.write_text(self._SOURCE)
+        alias = tmp_path / 'alias.py'
+        try:
+            alias.symlink_to(core)
+        except OSError:
+            pytest.skip('this platform cannot create symlinks')
+        return {str(alias): self._SOURCE, str(core): self._SOURCE}
+
+    def it_generates_as_many_gremlins_for_two_spellings_of_a_file_as_for_the_file_alone(self, tmp_path: Path) -> None:
+        both_spellings, file_alone = _session(), _session()
+        targets = self._targets(tmp_path)
+
+        _generate_gremlins(both_spellings, targets, tmp_path)
+        _generate_gremlins(file_alone, {str(tmp_path / 'core.py'): self._SOURCE}, tmp_path)
+
+        assert len(both_spellings.gremlins) == len(file_alone.gremlins) > 0
+
+    def it_keeps_the_real_file_rather_than_the_symlink_spelling(self, tmp_path: Path) -> None:
+        gs = _session()
+
+        _generate_gremlins(gs, self._targets(tmp_path), tmp_path)
+
+        assert {gremlin.file_path for gremlin in gs.gremlins} == {str(tmp_path / 'core.py')}
+
+    def it_warns_naming_the_skipped_alias_and_the_file_it_duplicates(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        gs = _session()
+
+        with caplog.at_level(logging.WARNING, logger='pytest_gremlins.plugin'):
+            _generate_gremlins(gs, self._targets(tmp_path), tmp_path)
+
+        assert (
+            f'Skipping {tmp_path / "alias.py"} as a mutation target: it is the same file on disk as '
+            f'{tmp_path / "core.py"}, so its gremlins are generated once under that path and stay active '
+            'when imported through either. List only one of them in the gremlin targets to silence this warning'
+        ) in caplog.messages
+
+    def it_picks_the_same_file_whatever_order_the_targets_arrive_in(self, tmp_path: Path) -> None:
+        targets = self._targets(tmp_path)
+        forward, backward = _session(), _session()
+
+        _generate_gremlins(forward, dict(targets), tmp_path)
+        _generate_gremlins(backward, dict(reversed(targets.items())), tmp_path)
+
+        assert (
+            {g.file_path for g in forward.gremlins}
+            == {g.file_path for g in backward.gremlins}
+            == {str(tmp_path / 'core.py')}
+        )
+
+    def it_skips_a_hardlink_to_another_target(self, tmp_path: Path) -> None:
+        core = tmp_path / 'core.py'
+        core.write_text(self._SOURCE)
+        twin = tmp_path / 'twin.py'
+        twin.hardlink_to(core)
+        gs = _session()
+
+        _generate_gremlins(gs, {str(twin): self._SOURCE, str(core): self._SOURCE}, tmp_path)
+
+        # Both names are real files, so the first in path order is kept whatever order they arrive in.
+        assert {gremlin.file_path for gremlin in gs.gremlins} == {str(core)}
+
+    def it_keeps_distinct_files_that_do_not_exist_on_disk(self, tmp_path: Path) -> None:
+        gs = _session()
+
+        _generate_gremlins(gs, {'a.py': self._SOURCE, 'b.py': self._SOURCE}, tmp_path)
+
+        assert {gremlin.file_path for gremlin in gs.gremlins} == {'a.py', 'b.py'}
 
 
 @pytest.mark.small

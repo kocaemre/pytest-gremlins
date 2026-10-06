@@ -268,6 +268,33 @@ print(get_active_gremlin())  # 'g001'
 
 The import hooks module intercepts Python imports to inject instrumented code.
 
+<!-- markdownlint-disable MD046 -->
+!!! note "What the mutation subprocess runs"
+    The subprocess that tests each gremlin does not use the `import_hooks` classes below. It runs
+    the finder in `pytest_gremlins.instrumentation.origin_finder`, which is copied into the
+    generated bootstrap script.
+
+    That finder never decides what a module is called. It asks the rest of `sys.meta_path` which
+    file a name resolves to and, when that file was instrumented, swaps in a loader that runs the
+    instrumented source. As a result, `sys.path` order, `pythonpath` settings, editable installs
+    and the same file imported under two names behave exactly as they do without gremlins.
+
+    The finder recognizes an instrumented file in two ways:
+
+    - **By path.** When the file name matches an instrumented file's name (ignoring case), the
+      finder compares the resolved real path (`normalize_origin`).
+    - **By file identity.** When the path does not match, for example `Src` for `src` on a
+      case-insensitive filesystem, or a symlink or hard link under another name, the finder
+      compares the file's device and inode. An inode of 0, which some Windows filesystems
+      report, never matches.
+
+    An import of an unrelated file costs a file-name comparison and one `stat` call.
+
+    Targets that are the same file on disk, such as a symlink to another target, generate
+    gremlins once: the duplicate is skipped with a warning.
+
+<!-- markdownlint-enable MD046 -->
+
 ### GremlinFinder
 
 MetaPathFinder that intercepts imports for instrumented modules.

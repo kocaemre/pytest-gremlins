@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from pytest_gremlins.cache.types import CachedGremlinResult
 
 
-RUNNER_FIDELITY_VERSION = 'rf8'
+RUNNER_FIDELITY_VERSION = 'rf9'
 """Bump when a change to how tests are executed can alter cached verdicts.
 
 ``rf3`` retires every verdict cached by v1.9.0 or by interim builds, which judged tests with the
@@ -38,6 +38,12 @@ cached TIMEOUT from an older build may be a gremlin that timed out only because 
 
 ``rf8`` retires verdicts cached while a package ``__init__.py`` was registered as ``pkg.__init__``, a name
 nothing imports (#591); every gremlin in such a file was cached as SURVIVED however well the tests caught it.
+
+``rf9`` retires verdicts cached while an instrumented file was registered under a module name guessed from
+``sys.path`` and ``pythonpath``, which could differ from the name the tests import it under (#597); every gremlin
+in such a file was cached as SURVIVED however well the tests caught it. Instrumented files are now matched by the
+file the import system resolves a name to, by its real path or, when a path is spelled differently from the
+disk, by its device and inode. Two targets that are one file on disk generate gremlins once.
 """
 
 
