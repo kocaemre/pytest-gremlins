@@ -236,7 +236,7 @@ command line.
 
 ### Cached results
 
-The incremental cache key includes a runner fidelity version (`rf9`), so verdicts cached by
+The incremental cache key includes a runner fidelity version (`rf10`), so verdicts cached by
 v1.9.0 or by interim builds, which used the lightweight runner, are recomputed once after upgrading.
 So are timeouts cached before they were confirmed against the unmutated tests (#565).
 So are verdicts cached while instrumented modules had no `__file__` (#525), when target code that read it
@@ -246,6 +246,8 @@ were all cached as SURVIVED.
 So are verdicts cached while instrumented files were registered under a module name guessed from
 `sys.path` and `pythonpath` (#597). When the guess differed from the name the tests imported, the
 instrumented code never loaded and that file's gremlins were all cached as SURVIVED.
+So are verdicts cached while instrumented modules were compiled under their module name (#563), when a
+test that looked up source (`inspect.getsource`) failed under every gremlin and was cached as ZAPPED.
 Gremlins whose mutant stopped the suite from loading (a conftest import error, a test module that
 failed to collect, or a changed parametrize id) are recorded as ZAPPED with the killing test
 `<collection>`; ones cached as ERROR before that change are recomputed too.

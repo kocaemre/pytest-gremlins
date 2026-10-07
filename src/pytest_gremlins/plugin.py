@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import base64
 import collections.abc
 from concurrent.futures import as_completed
 import contextlib
@@ -25,6 +26,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import pickle  # nosec B403 - only pickles the instrumented tree for its own subprocess; nothing is unpickled here
 import re
 import shlex
 import shutil
@@ -1492,9 +1494,11 @@ def _write_instrumented_sources(
 
     Creates a temporary directory containing:
     1. A JSON file mapping the normalized real path of each instrumented file to its
-       instrumented source code, the path that source came from, the file's device and
-       inode (``identity``, for spellings the path key misses) and the lowercased file
-       names it may be imported as (``names``, so the finder skips every other import
+       instrumented tree (``tree``: the instrumented AST, pickled and base64 encoded for the subprocess to
+       compile under the real file path; absent when the tree is too deep to pickle), its unparsed text
+       (``source``: always present, what the subprocess compiles when the tree is absent or too deep), the
+       path it came from, the file's device and inode (``identity``, for spellings the path key misses) and
+       the lowercased file names it may be imported as (``names``, so the finder skips every other import
        without touching the disk). No module name is recorded: the finder in the
        subprocess serves a file under whatever name the import system resolves to it.
     2. A bootstrap script that registers import hooks and runs pytest
@@ -1514,20 +1518,20 @@ def _write_instrumented_sources(
     """
     temp_dir = Path(tempfile.mkdtemp(prefix='pytest_gremlins_'))
 
-    gremlin_active_injection = f"""import os as _gremlin_os
-__gremlin_active__ = _gremlin_os.environ.get('{ACTIVE_GREMLIN_ENV_VAR}')
-del _gremlin_os
-"""
-
-    injection_nodes = ast.parse(gremlin_active_injection).body
-
     instrumented_sources: origin_finder.InstrumentedSources = {}
     for original_path, tree in instrumented_asts.items():
         origin = (rootdir / original_path).absolute()
-        injected_body = _prepend_injection(tree.body, injection_nodes)
+        instrumented_tree = _inject_gremlin_active(tree)
+        encoded_tree = _encode_tree(instrumented_tree)
+        if encoded_tree is None:
+            logger.debug(
+                'Instrumented tree for %s too deep to pickle; shipping unparsed source (reflowed line numbers)',
+                origin,
+            )
         spellings = [str(origin), os.path.realpath(origin), *(duplicates or {}).get(original_path, [])]
         instrumented_sources[normalize_origin(str(origin))] = {
-            'source': ast.unparse(ast.Module(body=injected_body, type_ignores=tree.type_ignores)),
+            'source': ast.unparse(instrumented_tree),
+            **({} if encoded_tree is None else {'tree': encoded_tree}),
             'origin': str(origin),
             'identity': file_identity(str(origin)),
             'file_names': sorted({Path(spelling).name.lower() for spelling in spellings}),
@@ -1545,14 +1549,40 @@ del _gremlin_os
     return temp_dir
 
 
+def _inject_gremlin_active(tree: ast.Module) -> ast.Module:
+    """Return ``tree`` with the ``__gremlin_active__`` assignment placed where the module may legally hold it."""
+    activation_source = f"""import os as _gremlin_os
+__gremlin_active__ = _gremlin_os.environ.get('{ACTIVE_GREMLIN_ENV_VAR}')
+del _gremlin_os
+"""
+    body = _prepend_injection(tree.body, ast.parse(activation_source).body)
+    return ast.Module(body=body, type_ignores=tree.type_ignores)
+
+
+def _encode_tree(instrumented_tree: ast.Module) -> str | None:
+    """Return ``instrumented_tree`` pickled and base64 encoded for sources.json, or ``None`` if nested too deeply.
+
+    The subprocess compiles the tree itself, under the real file path, so the original line numbers survive and
+    the subprocess's own optimize level and warning filters apply. Pickling recurses once per level of nesting,
+    bounded by the recursion limit (about 250 ``elif`` branches reach it on Python 3.11; on 3.12 and later
+    pickling goes much less deep per level and only fails at roughly 2,500 branches), so a ``RecursionError``
+    here means the file is shipped as its unparsed ``source`` alone, with the reflowed line numbers of the
+    releases before #563.
+    """
+    try:
+        return base64.b64encode(pickle.dumps(ast.fix_missing_locations(instrumented_tree))).decode('ascii')
+    except RecursionError:
+        return None
+
+
 def _prepend_injection(body: list[ast.stmt], injection_nodes: list[ast.stmt]) -> list[ast.stmt]:
     """Insert injection nodes after any module docstring and future imports.
 
     Python requires that ``from __future__`` imports appear before all other
-    statements (except the module docstring).  Inserting the gremlin activation
-    code via text concatenation before ``ast.unparse`` output violates this rule
-    when the source already contains a ``from __future__`` import, causing a
-    ``SyntaxError``.  This function inserts the injection at the AST level so
+    statements (except the module docstring).  Placing the gremlin activation
+    code first would violate this rule when the source already contains a
+    ``from __future__`` import, causing a ``SyntaxError`` at compile time.
+    This function inserts the injection at the AST level so
     the final ordering is always:
 
     1. Module docstring (if present)

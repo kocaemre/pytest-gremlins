@@ -6,17 +6,25 @@ swaps the loader only when that answer is an instrumented file.
 
 from __future__ import annotations
 
+import __future__  # isort: skip
+import ast
+import base64
+import builtins
 from collections.abc import (
     Callable,
 )
 import importlib
+import importlib.machinery
 import importlib.resources
 import importlib.util
 import inspect
+import json
 from pathlib import Path
+import pickle
 import pkgutil
 import sys
 import threading
+import traceback
 from types import (
     ModuleType,
     SimpleNamespace,
@@ -36,6 +44,7 @@ from pytest_gremlins.instrumentation.origin_finder import (
 from pytest_gremlins.plugin import (
     _get_bootstrap_script,
     _get_lightweight_runner_script,
+    _write_instrumented_sources,
 )
 
 Sources = InstrumentedSources
@@ -45,12 +54,22 @@ INSTRUMENTED = 'VALUE = "instrumented"\n'
 ORIGINAL = 'VALUE = "original"\n'
 
 
+def _encode(source: str) -> str:
+    """Ship ``source`` the way sources.json does: as a parsed tree, pickled and base64 encoded."""
+    return base64.b64encode(pickle.dumps(ast.parse(source))).decode('ascii')
+
+
 def _entry(origin: Path, source: str = INSTRUMENTED) -> Sources:
-    return {normalize_origin(str(origin)): {'source': source, 'origin': str(origin)}}
+    return {normalize_origin(str(origin)): {'tree': _encode(source), 'source': source, 'origin': str(origin)}}
 
 
 def _entry_with_identity(origin: Path, source: str = INSTRUMENTED) -> Sources:
-    entry = {'source': source, 'origin': str(origin), 'identity': file_identity(str(origin))}
+    entry = {
+        'tree': _encode(source),
+        'source': source,
+        'origin': str(origin),
+        'identity': file_identity(str(origin)),
+    }
     return {normalize_origin(str(origin)): entry}
 
 
@@ -437,15 +456,156 @@ class DescribeGremlinLoaderResourceReader:
     """Package data is read through the loader that found the file, when there is one."""
 
     def it_has_no_resource_reader_when_the_original_loader_offers_none(self) -> None:
-        loader = GremlinLoader(INSTRUMENTED, 'bare_mod', original_loader=None)
+        loader = GremlinLoader(_encode(INSTRUMENTED), original_loader=None, source=INSTRUMENTED)
 
         assert loader.get_resource_reader('bare_mod') is None
 
     def it_asks_the_original_loader_for_the_resource_reader(self) -> None:
         original = SimpleNamespace(get_resource_reader=lambda fullname: f'reader-for:{fullname}')
-        loader = GremlinLoader(INSTRUMENTED, 'data_mod', original_loader=original)
+        loader = GremlinLoader(_encode(INSTRUMENTED), original_loader=original, source=INSTRUMENTED)
 
         assert loader.get_resource_reader('data_mod') == 'reader-for:data_mod'
+
+
+def _module_from(name: str, origin: str) -> ModuleType:
+    module = ModuleType(name)
+    module.__spec__ = importlib.machinery.ModuleSpec(name, None, origin=origin)
+    return module
+
+
+@pytest.mark.small
+class DescribeGremlinLoaderCompilesShippedTree:
+    """The loader compiles the tree it was shipped under the spec's origin, so filename and lines survive (#563)."""
+
+    def it_compiles_under_the_origin_of_the_module_spec(self) -> None:
+        origin = 'C:\\project\\src\\origin_mod.py'
+        module = _module_from('origin_mod', origin)
+
+        GremlinLoader(_encode('def f():\n    return 1\n'), source='def f():\n    return 1\n').exec_module(module)
+
+        assert module.f.__code__.co_filename == origin  # type: ignore[attr-defined]
+
+    def it_keeps_the_line_numbers_of_the_shipped_tree(self) -> None:
+        module = _module_from('lines_mod', 'lines_mod.py')
+
+        GremlinLoader(_encode('\n' * 9 + 'def f():\n    return 1\n'), source='def f():\n    return 1\n').exec_module(
+            module
+        )
+
+        assert module.f.__code__.co_firstlineno == 10  # type: ignore[attr-defined]
+
+    def it_does_not_inherit_future_flags_from_the_loader_module(self) -> None:
+        module = _module_from('flags_mod', 'flags_mod.py')
+
+        GremlinLoader(_encode('def f():\n    return 1\n'), source='def f():\n    return 1\n').exec_module(module)
+
+        assert module.f.__code__.co_flags & __future__.annotations.compiler_flag == 0  # type: ignore[attr-defined]
+
+
+def _raise_recursion_error(*_args: object, **_kwargs: object) -> None:
+    raise RecursionError
+
+
+_real_compile = compile
+
+
+def compile_tree_too_deep(source: object, *args: object, **kwargs: object) -> object:
+    """Stand in for ``compile``: a tree is too deep for the stack, text compiles as usual."""
+    if isinstance(source, ast.AST):
+        raise RecursionError
+    return _real_compile(source, *args, **kwargs)  # type: ignore[call-overload]
+
+
+@pytest.mark.small
+class DescribeGremlinLoaderDeepTreeFallback:
+    """A tree too deep for this stack never fails the import: the loader compiles the shipped source instead (#563)."""
+
+    TREE_VALUE = 'VALUE = "from the tree"\n'
+    SOURCE_VALUE = 'VALUE = "from the source"\n'
+
+    def it_compiles_the_source_when_unpickling_the_tree_exceeds_the_recursion_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(pickle, 'loads', _raise_recursion_error)
+        module = _module_from('deep_unpickle_mod', 'deep_unpickle_mod.py')
+
+        GremlinLoader(_encode(self.TREE_VALUE), source=self.SOURCE_VALUE).exec_module(module)
+
+        assert module.VALUE == 'from the source'  # type: ignore[attr-defined]
+
+    def it_compiles_the_source_when_compiling_the_tree_exceeds_the_recursion_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(builtins, 'compile', compile_tree_too_deep)
+        module = _module_from('deep_compile_mod', 'deep_compile_mod.py')
+
+        GremlinLoader(_encode(self.TREE_VALUE), source=self.SOURCE_VALUE).exec_module(module)
+
+        assert module.VALUE == 'from the source'  # type: ignore[attr-defined]
+
+    def it_requires_the_source_to_fall_back_to(self) -> None:
+        with pytest.raises(TypeError, match='source'):
+            GremlinLoader(None)  # type: ignore[call-arg]
+
+    def it_compiles_the_source_when_no_tree_was_shipped(self) -> None:
+        module = _module_from('no_tree_mod', 'no_tree_mod.py')
+
+        GremlinLoader(None, source=self.SOURCE_VALUE).exec_module(module)
+
+        assert module.VALUE == 'from the source'  # type: ignore[attr-defined]
+
+    def it_prefers_the_tree_when_it_compiles(self) -> None:
+        module = _module_from('shallow_mod', 'shallow_mod.py')
+
+        GremlinLoader(_encode(self.TREE_VALUE), source=self.SOURCE_VALUE).exec_module(module)
+
+        assert module.VALUE == 'from the tree'  # type: ignore[attr-defined]
+
+    def it_names_the_module_in_the_code_it_compiles_from_source_as_main_did(self) -> None:
+        module = _module_from('fallback_name_mod', '/project/fallback_name_mod.py')
+
+        GremlinLoader(None, source='def f():\n    return 1\n').exec_module(module)
+
+        assert module.f.__code__.co_filename == 'fallback_name_mod'  # type: ignore[attr-defined]
+
+
+@pytest.mark.medium
+class DescribeInstrumentedTracebacks:
+    """A traceback from instrumented code names the real file and the line the failing statement is on (#563)."""
+
+    def it_reports_the_original_line_number_of_a_failing_statement(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, install_finder: Install
+    ) -> None:
+        original = '# padding\n' * 20 + 'def boom():\n    value = 1\n    raise ValueError(value)\n'
+        target = tmp_path / 'traceback_mod.py'
+        target.write_text(original)
+        monkeypatch.syspath_prepend(str(tmp_path))
+        sources_dir = _write_instrumented_sources({str(target): ast.parse(original)}, tmp_path)
+        install_finder(json.loads((sources_dir / 'sources.json').read_text()))
+        module = _import('traceback_mod')
+
+        with pytest.raises(ValueError, match='1') as raised:
+            module.boom()  # type: ignore[attr-defined]
+
+        frame = traceback.extract_tb(raised.value.__traceback__)[-1]
+        assert (frame.filename, frame.lineno, frame.line) == (str(target), 23, 'raise ValueError(value)')
+
+
+@pytest.mark.medium
+class DescribeGremlinFinderCompileFilename:
+    """The finder hands the loader the origin of the spec it resolved (#563)."""
+
+    def it_hands_the_origin_of_the_resolved_spec_to_the_loader(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, install_finder: Install
+    ) -> None:
+        target = tmp_path / 'filename_mod.py'
+        target.write_text(ORIGINAL)
+        monkeypatch.syspath_prepend(str(tmp_path))
+        install_finder(_entry(target, 'def f():\n    return 1\n'))
+
+        module = _import('filename_mod')
+
+        assert module.f.__code__.co_filename == str(target)
 
 
 @pytest.mark.medium

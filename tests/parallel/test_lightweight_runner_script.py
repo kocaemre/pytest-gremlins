@@ -7,8 +7,11 @@ or 0 (survived).
 
 from __future__ import annotations
 
+import ast
+import base64
 import json
 from pathlib import Path
+import pickle
 import subprocess
 import sys
 import textwrap
@@ -157,7 +160,8 @@ class DescribeLightweightRunnerInstrumentedModules:
         origin = tmp_path / 'target.py'
         origin.write_text('VALUE = 0\n', encoding='utf-8')
         sources = tmp_path / 'sources.json'
-        entry = {'source': 'VALUE = 1\n', 'origin': str(origin)}
+        tree = base64.b64encode(pickle.dumps(ast.parse('VALUE = 1\n'))).decode('ascii')
+        entry = {'tree': tree, 'source': 'VALUE = 1\n', 'origin': str(origin)}
         sources.write_text(json.dumps({normalize_origin(str(origin)): entry}), encoding='utf-8')
         test_source = f"""
             import os
