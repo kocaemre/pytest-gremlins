@@ -159,14 +159,15 @@ def _specialize_asserts(tree: ast.Module) -> ast.Module:
 
 
 class GremlinLoader(importlib.abc.Loader):
-    """Compile the shipped instrumented tree, or its source when the tree is too deep, and execute it.
+    """Compile the shipped instrumented tree, or its source when the tree is unusable, and execute it.
 
     The tree is compiled under the real file, so ``inspect.getsource``, linecache and tracebacks stay aligned
     with the file on disk. Unpickling or compiling a tree nested deeper than this process's stack can handle
     (a long ``elif`` chain) raises ``RecursionError``, and the interpreter's C recursion limit cannot be raised.
     The loader then compiles ``source``, the unparsed instrumented text, exactly as the releases before #563
     did: the import never fails because of AST depth, but that file's line numbers are the reflowed ones of
-    the unparsed text. A parent that could not pickle the tree ships no tree at all.
+    the unparsed text. A tree this interpreter cannot unpickle at all (one pickled by another Python version)
+    gets the same fallback. A parent that could not pickle the tree ships no tree at all.
     """
 
     def __init__(self, encoded_tree: str | None, original_loader: object = None, *, source: str) -> None:
@@ -232,14 +233,30 @@ class GremlinLoader(importlib.abc.Loader):
         hook._rewritten_names[module.__name__] = Path(origin)
         rewrite_asserts(_specialize_asserts(tree), source_bytes, origin, hook.config)
 
-    def _compile_tree(self, module: ModuleType) -> CodeType | None:
-        """Return the shipped tree compiled under the real file, or ``None`` when it is absent or too deep."""
-        if self._encoded_tree is None:
-            return None
+    @staticmethod
+    def _unpickle_tree(encoded_tree: str) -> ast.Module | None:
+        """Return the shipped tree, or ``None`` when this interpreter cannot rebuild it.
+
+        A tree pickled by another Python version raises ``TypeError`` (its node constructors differ), and the
+        spawn hook's version gate keeps that from happening in practice. Whatever the reason, the import must
+        not fail because of it: the caller falls back to the shipped source.
+        """
         try:
             # The parent wrote this tree into its own temp directory from our own transformation of the user's
             # file; it is not untrusted input.
-            tree: ast.Module = pickle.loads(base64.b64decode(self._encoded_tree))  # noqa: S301  # nosec B301
+            tree: ast.Module = pickle.loads(base64.b64decode(encoded_tree))  # noqa: S301  # nosec B301
+        except Exception:
+            return None
+        return tree
+
+    def _compile_tree(self, module: ModuleType) -> CodeType | None:
+        """Return the shipped tree compiled under the real file, or ``None`` when it is absent or unusable."""
+        if self._encoded_tree is None:
+            return None
+        tree = self._unpickle_tree(self._encoded_tree)
+        if tree is None:
+            return None
+        try:
             if self._original_loader_is_rewrite_hook():
                 with open(module.__spec__.origin, 'rb') as source_file:  # type: ignore[union-attr, arg-type]  # noqa: PTH123
                     self._rewrite_asserts(tree, source_file.read(), module)
@@ -256,6 +273,10 @@ class GremlinFinder(importlib.abc.MetaPathFinder):
     and (2) identity-based (inode) for differently-named aliases (symlinks, hard links).
     """
 
+    # The bootstrap and the spawn hook (#604) each embed their own copy of this class, so ``isinstance`` cannot
+    # tell whether a finder on ``sys.meta_path`` is ours. This marker can.
+    is_gremlin_finder = True
+
     def __init__(self, instrumented_sources: InstrumentedSources) -> None:
         self._instrumented_sources = instrumented_sources
         # Only a file named like an instrumented one is worth a realpath: most imports are not.
@@ -271,6 +292,10 @@ class GremlinFinder(importlib.abc.MetaPathFinder):
             entry['identity']: key for key, entry in instrumented_sources.items() if entry.get('identity')
         }
         self._resolving: set[tuple[int, str]] = set()
+
+    def serves(self, instrumented_sources: InstrumentedSources) -> bool:
+        """Return whether this finder was built for exactly ``instrumented_sources``."""
+        return self._instrumented_sources == instrumented_sources
 
     def find_spec(  # noqa: D102
         self, fullname: str, path: Sequence[str] | None = None, target: ModuleType | None = None
@@ -330,7 +355,18 @@ class GremlinFinder(importlib.abc.MetaPathFinder):
 
 
 def install(instrumented_sources: InstrumentedSources) -> GremlinFinder:
-    """Register a finder for ``instrumented_sources`` ahead of every other finder and return it."""
+    """Register a finder for ``instrumented_sources`` ahead of every other finder and return it.
+
+    Idempotent: the spawn hook (#604) and the bootstrap both call this in the same process, and one finder
+    must serve it. A finder already installed for equal sources is moved to the front and returned; one for
+    other sources is replaced.
+    """
+    installed_finders: list[Any] = [finder for finder in sys.meta_path if getattr(finder, 'is_gremlin_finder', False)]
+    for installed_finder in installed_finders:
+        sys.meta_path.remove(installed_finder)
+        if installed_finder.serves(instrumented_sources):
+            sys.meta_path.insert(0, installed_finder)
+            return installed_finder  # type: ignore[no-any-return]
     finder = GremlinFinder(instrumented_sources)
     sys.meta_path.insert(0, finder)
     return finder
