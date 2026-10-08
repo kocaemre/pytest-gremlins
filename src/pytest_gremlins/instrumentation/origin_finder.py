@@ -6,12 +6,15 @@ instrumented source. Names, ``sys.path`` precedence, packages, editable installs
 therefore behave exactly as they do without gremlins, in every execution mode.
 
 This file is copied verbatim into the generated bootstrap script, which cannot import pytest-gremlins and
-must start fast. Keep it standard-library only and free of ``from __future__`` imports.
+must start fast. Keep it standard-library only and free of ``from __future__`` imports. The one exception is
+``_pytest.assertion.rewrite`` (and ``pathlib`` with it), imported lazily inside the loader and only when pytest's
+assertion-rewrite hook served the module; they are never imported at module level.
 """
 
 import ast
 import base64
 from collections.abc import Sequence
+import copy
 import importlib.abc
 import importlib.machinery
 import os
@@ -48,6 +51,113 @@ def file_identity(path: str) -> str | None:
     return None if status.st_ino == 0 else f'{status.st_dev}:{status.st_ino}'
 
 
+def _switch_gremlin_id(node: ast.AST) -> str | None:
+    """Return the gremlin id of a ``mutated if __gremlin_active__ == 'id' else original`` switch, else ``None``."""
+    if not (isinstance(node, ast.IfExp) and isinstance(node.test, ast.Compare)):
+        return None
+    test = node.test
+    is_active_check = (
+        isinstance(test.left, ast.Name)
+        and test.left.id == '__gremlin_active__'
+        and len(test.ops) == 1
+        and isinstance(test.ops[0], ast.Eq)
+        and len(test.comparators) == 1
+    )
+    comparator = test.comparators[0] if is_active_check else None
+    return str(comparator.value) if isinstance(comparator, ast.Constant) else None
+
+
+class _SwitchIds(ast.NodeVisitor):
+    """Collect the ids of every gremlin switch below a node, in source order."""
+
+    def __init__(self) -> None:
+        self.ids: list[str] = []
+
+    def generic_visit(self, node: ast.AST) -> None:
+        gremlin_id = _switch_gremlin_id(node)
+        if gremlin_id is not None and gremlin_id not in self.ids:
+            self.ids.append(gremlin_id)
+        super().generic_visit(node)
+
+
+class _ResolveSwitches(ast.NodeTransformer):
+    """Replace every gremlin switch below a node by the branch one gremlin id (or none) selects."""
+
+    def __init__(self, active_id: str | None) -> None:
+        self._active_id = active_id
+
+    def generic_visit(self, node: ast.AST) -> ast.AST:
+        gremlin_id = _switch_gremlin_id(node)
+        if gremlin_id is not None:
+            chosen = node.body if gremlin_id == self._active_id else node.orelse  # type: ignore[attr-defined]
+            return self.visit(chosen)  # type: ignore[no-any-return]
+        return super().generic_visit(node)
+
+
+def _specialize_assert(node: ast.Assert) -> ast.stmt:
+    """Return ``node``, or when its condition holds gremlin switches, one plain assert per gremlin.
+
+    pytest explains a failed assert by walking its condition, and a ``mutated if active == 'id' else original``
+    switch is opaque to that walk: the message would lose every operand. Choosing the branch with an ``if``
+    statement around ordinary asserts lets pytest's rewriter explain each of them as it does without gremlins.
+    """
+    collector = _SwitchIds()
+    collector.visit(node.test)
+    if node.msg is not None:
+        collector.visit(node.msg)
+    if not collector.ids:
+        return node
+    fallthrough: list[ast.stmt] = [_resolve_assert(node, None)]
+    for gremlin_id in reversed(collector.ids):
+        check = ast.Compare(
+            left=ast.Name(id='__gremlin_active__', ctx=ast.Load()),
+            ops=[ast.Eq()],
+            comparators=[ast.Constant(value=gremlin_id)],
+        )
+        fallthrough = [ast.If(test=check, body=[_resolve_assert(node, gremlin_id)], orelse=fallthrough)]
+    dispatch: ast.stmt = ast.copy_location(fallthrough[0], node)
+    return ast.fix_missing_locations(dispatch)
+
+
+def _resolve_assert(node: ast.Assert, active_id: str | None) -> ast.Assert:
+    return _ResolveSwitches(active_id).visit(copy.deepcopy(node))  # type: ignore[no-any-return]
+
+
+def _nested_statement_lists(node: ast.stmt) -> list[list[ast.stmt]]:
+    """Return the statement lists directly inside ``node``: bodies, else-branches, handlers and match cases."""
+    nested: list[list[ast.stmt]] = []
+    for _, value in ast.iter_fields(node):
+        if not isinstance(value, list):
+            continue
+        if value and all(isinstance(item, ast.stmt) for item in value):
+            nested.append(value)
+        else:
+            nested.extend(item.body for item in value if isinstance(item, (ast.ExceptHandler, ast.match_case)))
+    return nested
+
+
+def _specialize_asserts(tree: ast.Module) -> ast.Module:
+    """Specialize every assert in ``tree`` in place, walking statements with an explicit stack.
+
+    A module the parent could instrument is nested as deep as a few hundred ``elif`` branches, which a recursive
+    walk over the whole module cannot always survive. Only the one assert's own expression is walked
+    recursively, and an assert that still overflows the stack is left as it is: it then runs with the
+    switch in its condition, its message unexplained, but the module keeps every other rewritten assert.
+    """
+    pending: list[list[ast.stmt]] = [tree.body]
+    while pending:
+        statements = pending.pop()
+        for index, statement in enumerate(statements):
+            if isinstance(statement, ast.Assert):
+                try:
+                    statements[index] = _specialize_assert(statement)
+                except RecursionError:
+                    continue
+            else:
+                pending.extend(_nested_statement_lists(statement))
+    return tree
+
+
 class GremlinLoader(importlib.abc.Loader):
     """Compile the shipped instrumented tree, or its source when the tree is too deep, and execute it.
 
@@ -81,9 +191,46 @@ class GremlinLoader(importlib.abc.Loader):
     def exec_module(self, module: ModuleType) -> None:  # noqa: D102
         code = self._compile_tree(module)
         if code is None:
-            # The source is our own AST transformation of the user's file, not untrusted input.
-            code = compile(self._source, module.__name__, 'exec')
+            code = self._compile_source(module)
         exec(code, module.__dict__)  # noqa: S102
+
+    def _compile_source(self, module: ModuleType) -> CodeType:
+        """Compile the shipped source text, asserting like pytest would when pytest's hook served the module."""
+        if not self._original_loader_is_rewrite_hook():
+            # The source is our own AST transformation of the user's file, not untrusted input.
+            return compile(self._source, module.__name__, 'exec')
+        try:
+            tree = ast.parse(self._source, module.__name__)
+            self._rewrite_asserts(tree, self._source.encode(), module)
+            return compile(tree, module.__name__, 'exec', dont_inherit=True)
+        except RecursionError:
+            # A tree too deep to unpickle is too deep to parse and rewrite: the module runs with plain asserts.
+            return compile(self._source, module.__name__, 'exec')
+
+    def _original_loader_is_rewrite_hook(self) -> bool:
+        """Tell whether pytest's assertion-rewrite hook found this module, without importing pytest.
+
+        The class is recognised by its module alone: the hook is the only loader that module puts on
+        ``sys.meta_path``, so a rename of the class cannot silently turn rewriting off.
+        """
+        return type(self._original_loader).__module__ == '_pytest.assertion.rewrite'
+
+    def _rewrite_asserts(self, tree: ast.Module, source_bytes: bytes, module: ModuleType) -> None:
+        """Rewrite the asserts in ``tree`` and record the module as rewritten, as pytest's own loader does.
+
+        The hook answers a spec with itself as the loader only for a module it decided to rewrite, so a module
+        served by it keeps rewritten assertion messages even though this loader runs the instrumented tree.
+        """
+        # Imported here, never at the top: this file is inlined into a bootstrap that must not import pytest.
+        from pathlib import Path  # noqa: PLC0415
+
+        from _pytest.assertion.rewrite import rewrite_asserts  # noqa: PLC0415
+
+        hook: Any = self._original_loader
+        spec = module.__spec__
+        origin: str = spec.origin  # type: ignore[union-attr, assignment]
+        hook._rewritten_names[module.__name__] = Path(origin)
+        rewrite_asserts(_specialize_asserts(tree), source_bytes, origin, hook.config)
 
     def _compile_tree(self, module: ModuleType) -> CodeType | None:
         """Return the shipped tree compiled under the real file, or ``None`` when it is absent or too deep."""
@@ -93,6 +240,9 @@ class GremlinLoader(importlib.abc.Loader):
             # The parent wrote this tree into its own temp directory from our own transformation of the user's
             # file; it is not untrusted input.
             tree: ast.Module = pickle.loads(base64.b64decode(self._encoded_tree))  # noqa: S301  # nosec B301
+            if self._original_loader_is_rewrite_hook():
+                with open(module.__spec__.origin, 'rb') as source_file:  # type: ignore[union-attr, arg-type]  # noqa: PTH123
+                    self._rewrite_asserts(tree, source_file.read(), module)
             return compile(tree, module.__spec__.origin, 'exec', dont_inherit=True)  # type: ignore[union-attr, arg-type]
         except RecursionError:
             # Silent on purpose: the loader falls back to the shipped source, as the class docstring explains.
