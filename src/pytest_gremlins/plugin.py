@@ -45,6 +45,7 @@ import coverage
 from coverage.exceptions import CoverageException
 import pytest
 
+from pytest_gremlins import node_id_args
 from pytest_gremlins.cache.hasher import ContentHasher
 from pytest_gremlins.cache.incremental import IncrementalCache
 from pytest_gremlins.cache.types import CachedGremlinResult
@@ -93,6 +94,7 @@ from pytest_gremlins.instrumentation.transformer import (
     get_default_registry,
     transform_source,
 )
+from pytest_gremlins.node_id_file import command_with_node_ids_file
 from pytest_gremlins.parallel.aggregator import ResultAggregator
 from pytest_gremlins.parallel.batch_executor import BatchExecutor
 from pytest_gremlins.parallel.exit_codes import (
@@ -212,6 +214,14 @@ class CoveragePrescanTimeoutError(Exception):
     def __init__(self, seconds: int) -> None:
         super().__init__(f'coverage pre-scan exceeded {seconds}s')
         self.seconds = seconds
+
+
+class CoveragePrescanLaunchError(Exception):
+    """Raised when the operating system cannot start the coverage pre-scan subprocess (issue #485)."""
+
+    def __init__(self, cause: OSError) -> None:
+        super().__init__(f'coverage pre-scan could not start ({cause})')
+        self.cause = cause
 
 
 @dataclass
@@ -1656,6 +1666,8 @@ import sys
 
 __ORIGIN_FINDER_SOURCE__
 
+__NODE_ID_ARGS_SOURCE__
+
 
 def main():
     sources_file = os.environ.get('PYTEST_GREMLINS_SOURCES_FILE')
@@ -1719,8 +1731,17 @@ def main():
     marker = os.path.join(os.path.dirname(sources_file), '__UNATTRIBUTABLE_MARKER__')
     can_attribute_load_failures = not os.path.exists(marker)
 
+    # The parent keeps node ids off the command line (Windows caps it at 32,767 characters) and names a
+    # file holding them; pytest receives the same arguments it would with the ids appended to argv. A file
+    # that cannot be read exits with pytest's usage error code, never 1, which would score as a kill.
+    try:
+        pytest_args = args_with_node_ids_from_file(sys.argv[1:])
+    except (OSError, ValueError, RecursionError, MemoryError) as error:
+        print(f'pytest-gremlins: cannot read the node ids file for this run ({error})', file=sys.stderr)
+        sys.exit(int(pytest.ExitCode.USAGE_ERROR))
+
     recorder = SuiteLoadRecorder()
-    exit_code = pytest.main(sys.argv[1:], plugins=[FinderFronter(), recorder])
+    exit_code = pytest.main(pytest_args, plugins=[FinderFronter(), recorder])
     load_failure_exit = exit_code in (pytest.ExitCode.USAGE_ERROR, pytest.ExitCode.INTERRUPTED)
     if can_attribute_load_failures and recorder.suite_failed_to_load and load_failure_exit:
         exit_code = __COLLECTION_FAILED_EXIT_CODE__
@@ -1734,6 +1755,7 @@ if __name__ == '__main__':
         script.replace('__COLLECTION_FAILED_EXIT_CODE__', str(GREMLIN_COLLECTION_FAILED_EXIT_CODE))
         .replace('__UNATTRIBUTABLE_MARKER__', UNATTRIBUTABLE_MARKER)
         .replace('__ORIGIN_FINDER_SOURCE__', inspect.getsource(origin_finder))
+        .replace('__NODE_ID_ARGS_SOURCE__', inspect.getsource(node_id_args))
     )
 
 
@@ -2082,7 +2104,7 @@ def _collect_unmutated(
 ) -> ControlRunOutcome:
     """Collect ``node_ids`` with the bootstrap, using a gremlin run's command and env minus the gremlin."""
     command, env = _unmutated_command_and_env(gremlin_session, rootdir)
-    return run_control(command, node_ids, rootdir, env)
+    return run_control(command, node_ids, rootdir, env, node_ids_dir=gremlin_session.instrumented_dir)
 
 
 def _confirm_collection_kill(
@@ -2167,7 +2189,12 @@ def _confirm_timeout_kill(
     if selection not in gremlin_session.unmutated_timeout_checks:
         command, env = _unmutated_command_and_env(gremlin_session, rootdir)
         gremlin_session.unmutated_timeout_checks[selection] = run_unmutated(
-            command, node_ids, rootdir, env, timeout=gremlin_session.mutant_timeout
+            command,
+            node_ids,
+            rootdir,
+            env,
+            timeout=gremlin_session.mutant_timeout,
+            node_ids_dir=gremlin_session.instrumented_dir,
         )
         outcome = gremlin_session.unmutated_timeout_checks[selection]
         logger.debug(
@@ -2444,6 +2471,15 @@ def _warn_prescan_timeout(seconds: int) -> None:
     )
 
 
+def _warn_prescan_launch_failure(launch_error: CoveragePrescanLaunchError) -> None:
+    """Warn that the pre-scan could not be run, naming the cause (issue #485)."""
+    warnings.warn(
+        f'pytest-gremlins: coverage pre-scan could not start ({launch_error.cause}); '
+        'coverage-guided test selection disabled, so every gremlin runs the full test suite',
+        stacklevel=1,
+    )
+
+
 def _warn_no_coverage_data() -> None:
     """Warn that the pre-scan finished but recorded nothing (issue #113)."""
     warnings.warn(
@@ -2474,6 +2510,9 @@ def _run_prescan_reporting_problems(
         )
     except CoveragePrescanTimeoutError as timeout_error:
         _warn_prescan_timeout(timeout_error.seconds)
+        return {}
+    except CoveragePrescanLaunchError as launch_error:
+        _warn_prescan_launch_failure(launch_error)
         return {}
     if not coverage_data:
         _warn_no_coverage_data()
@@ -2679,6 +2718,32 @@ def _prescan_env() -> dict[str, str]:
     return env
 
 
+def _launch_prescan(command: list[str], node_ids: list[str], rootdir: Path, timeout: int) -> None:
+    """Run the pre-scan ``command`` on ``node_ids``, handed over in a file so the command line stays short (#485).
+
+    Windows refuses a command line over 32,767 characters, which a large suite's node ids alone can exceed.
+    The file lives in a temporary directory that is removed when the pre-scan ends, however it ends.
+
+    Raises:
+        CoveragePrescanTimeoutError: If the pre-scan exceeds ``timeout`` seconds.
+        CoveragePrescanLaunchError: If the operating system cannot start the pre-scan.
+    """
+    try:
+        with tempfile.TemporaryDirectory(prefix='pytest_gremlins_prescan_', ignore_cleanup_errors=True) as node_ids_dir:
+            subprocess.run(  # Intentional: runs pytest test commands
+                command_with_node_ids_file(command, node_ids, Path(node_ids_dir)),
+                cwd=str(rootdir),
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+                env=_prescan_env(),
+            )
+    except subprocess.TimeoutExpired as expired:
+        raise CoveragePrescanTimeoutError(timeout) from expired
+    except OSError as launch_error:
+        raise CoveragePrescanLaunchError(launch_error) from launch_error
+
+
 def _run_tests_with_coverage(
     test_node_ids: list[str],
     rootdir: Path,
@@ -2727,6 +2792,7 @@ def _run_tests_with_coverage(
 
     Raises:
         CoveragePrescanTimeoutError: If the pre-scan exceeds ``timeout`` seconds.
+        CoveragePrescanLaunchError: If the operating system cannot start the pre-scan.
     """
     coverage_db_path = rootdir / '.coverage'
     coverage_db_path.unlink(missing_ok=True)
@@ -2752,30 +2818,22 @@ def _run_tests_with_coverage(
         'run',
         f'--rcfile={coveragerc_path}',
         '-m',
-        'pytest',
+        'pytest_gremlins.coverage.prescan_main',
         '-p',
         'pytest_gremlins.coverage.subprocess_bootstrap',
         '-p',
         'no:gremlins',
         '-o',
         f'addopts={addopts_without_gremlins(addopts_without_xdist(preserved_addopts))}',
-        *test_node_ids,
         '--tb=no',
         '-q',
     ]
 
     try:
-        subprocess.run(  # Intentional: runs pytest test commands
-            cmd,
-            cwd=str(rootdir),
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-            env=_prescan_env(),
-        )
-    except subprocess.TimeoutExpired as expired:
+        _launch_prescan(cmd, test_node_ids, rootdir, timeout)
+    except (CoveragePrescanTimeoutError, CoveragePrescanLaunchError):
         coveragerc_path.unlink(missing_ok=True)
-        raise CoveragePrescanTimeoutError(timeout) from expired
+        raise
 
     coverage_by_test: dict[str, dict[str, list[int]]] = {}
 
@@ -3694,13 +3752,15 @@ def _build_filtered_test_command(
         gremlin_session: The current gremlin session.
 
     Returns:
-        Command list with test node IDs appended in the same order.
+        Command list that runs the selected node IDs in the same order. They travel in a file named on the
+        command line, so a full-suite selection cannot exceed Windows' 32,767 character limit (#485); without an
+        instrumented directory to hold the file they are appended to the command.
     """
-    command = list(base_command)
-
-    command.extend(_node_ids_for_tests(selected_tests, gremlin_session))
-
-    return command
+    return command_with_node_ids_file(
+        base_command,
+        _node_ids_for_tests(selected_tests, gremlin_session),
+        gremlin_session.instrumented_dir,
+    )
 
 
 def _pytest_cov_available() -> bool:
