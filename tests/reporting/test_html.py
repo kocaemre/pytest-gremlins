@@ -80,6 +80,17 @@ class DescribeHtmlReporterBasicStructure:
 class DescribeHtmlReporterContent:
     """Tests for HTML content."""
 
+    def it_escapes_skipped_file_paths_and_reasons(self) -> None:
+        html = HtmlReporter().to_html(
+            MutationScore.from_results([]),
+            skipped_files={'<script>alert(1)</script>.py': 'failed <script>alert(2)</script>'},
+        )
+
+        assert '<script>alert(1)</script>' not in html
+        assert '<script>alert(2)</script>' not in html
+        assert '&lt;script&gt;alert(1)&lt;/script&gt;.py' in html
+        assert 'failed &lt;script&gt;alert(2)&lt;/script&gt;' in html
+
     def it_includes_title(self, make_result):
         results = [make_result(GremlinResultStatus.ZAPPED)]
         score = MutationScore.from_results(results)

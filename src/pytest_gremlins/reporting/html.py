@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+from html import escape
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -84,7 +85,13 @@ class HtmlReporter:
     historical trend chart for viewing mutation testing results in a browser.
     """
 
-    def to_html(self, score: MutationScore, history: list[dict[str, Any]] | None = None) -> str:
+    def to_html(
+        self,
+        score: MutationScore,
+        history: list[dict[str, Any]] | None = None,
+        *,
+        skipped_files: dict[str, str] | None = None,
+    ) -> str:
         """Convert mutation score to HTML string.
 
         Args:
@@ -92,12 +99,20 @@ class HtmlReporter:
             history: Optional list of historical score entries from load_history.
                      When provided, a trend section is rendered.  Pass an empty
                      list to render the "no data yet" placeholder.
+            skipped_files: Paths and reasons for files that could not be instrumented.
 
         Returns:
             Complete HTML document as a string.
         """
         chart_data = self._build_chart_data(score)
         history_html = self._render_history_section(history) if history is not None else ''
+        skipped_html = ''
+        if skipped_files:
+            rows = ''.join(f'<li>{escape(path)}: {escape(reason)}</li>' for path, reason in skipped_files.items())
+            skipped_html = (
+                '<section aria-label="Skipped files"><h2>Files skipped and not mutation tested</h2>'
+                f'<ul>{rows}</ul></section>'
+            )
         return f"""<!DOCTYPE html>
 <html lang="en" data-theme="dark">
 <head>
@@ -122,6 +137,7 @@ class HtmlReporter:
         </header>
         <main>
         {self._render_summary(score)}
+        {skipped_html}
         {self._render_charts(score, chart_data)}
         {self._render_results_table(score)}
         {self._render_pardoned_section(score)}
@@ -139,7 +155,9 @@ class HtmlReporter:
 </body>
 </html>"""
 
-    def write_report(self, score: MutationScore, output_path: Path) -> None:
+    def write_report(
+        self, score: MutationScore, output_path: Path, *, skipped_files: dict[str, str] | None = None
+    ) -> None:
         """Write mutation report to an HTML file and persist history.
 
         Creates any missing parent directories before writing.  History is
@@ -150,6 +168,7 @@ class HtmlReporter:
         Args:
             score: The MutationScore to write.
             output_path: Path to the output HTML file.
+            skipped_files: Paths and reasons for files that could not be instrumented.
         """
         output_path.parent.mkdir(parents=True, exist_ok=True)
         history_path = output_path.parent / 'history.json'
@@ -162,7 +181,7 @@ class HtmlReporter:
         except Exception:
             logger.warning('Failed to persist history for report at %s', output_path, exc_info=True)
         history = load_history(history_path)
-        output_path.write_text(self.to_html(score, history=history), encoding='utf-8')
+        output_path.write_text(self.to_html(score, history=history, skipped_files=skipped_files), encoding='utf-8')
         logger.info('HTML report written to %s', output_path)
 
     def _get_styles(self) -> str:
