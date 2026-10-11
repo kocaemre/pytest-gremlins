@@ -176,8 +176,10 @@ class DescribeGremlinSubprocessEnvVars:
         with patch('pytest_gremlins.plugin.subprocess.run', side_effect=capture_env):
             _test_gremlin(gremlin, ['pytest'], tmp_path, instrumented_dir=tmp_path, timeout=30)
 
-        assert GREMLIN_SOURCES_ENV_VAR in captured_env
-        assert captured_env[GREMLIN_SOURCES_ENV_VAR] == str(tmp_path / 'sources.json')
+        forwards_sources = GREMLIN_SOURCES_ENV_VAR in captured_env
+        assert forwards_sources
+        forwarded_path = captured_env[GREMLIN_SOURCES_ENV_VAR]
+        assert forwarded_path == str(tmp_path / 'sources.json')
 
     def it_omits_sources_env_var_when_instrumented_dir_is_none(self, tmp_path: Path) -> None:
         """GREMLIN_SOURCES_ENV_VAR is NOT set when instrumented_dir is None."""
@@ -196,4 +198,5 @@ class DescribeGremlinSubprocessEnvVars:
         with patch('pytest_gremlins.plugin.subprocess.run', side_effect=capture_env):
             _test_gremlin(gremlin, ['pytest'], tmp_path, instrumented_dir=None, timeout=30)
 
-        assert GREMLIN_SOURCES_ENV_VAR not in captured_env
+        forwards_sources = GREMLIN_SOURCES_ENV_VAR in captured_env
+        assert not forwards_sources
