@@ -12,19 +12,28 @@ import pytest
 @pytest.mark.small
 class DescribeEnvironmentAssertionChecker:
     @pytest.mark.parametrize(
-        'source',
+        ('source', 'expected'),
         [
-            "env = dict(os.environ)\nassert 'SECRET' not in env",
-            'env = os.environ\nassert len(env) == 0',
-            "env = run.call_args.kwargs['env']\nassert env.items()",
-            "assert kwargs['env'] == {}",
-            'env = _prescan_env()\nassert env == {}',
-            "env = dict(os.environ)\nassert env['SECRET'] == 'ok'",
-            "env = dict(os.environ)\nif True:\n    assert 'SECRET' not in env",
+            ("env = dict(os.environ)\nassert 'SECRET' not in env", [2]),
+            ('env = os.environ\nassert len(env) == 0', [2]),
+            ("env = run.call_args.kwargs['env']\nassert env.items()", [2]),
+            ("assert kwargs['env'] == {}", [1]),
+            ('env = _prescan_env()\nassert env == {}', [2]),
+            ("env = dict(os.environ)\nassert env['SECRET'] == 'ok'", []),
+            ("env = dict(os.environ)\nif True:\n    assert 'SECRET' not in env", [3]),
+            ("assert os.environ.get('SECRET') is None", [1]),
+            ("assert 'SECRET' not in os.environ.keys()", [1]),
+            ('assert os.environ.values() == []', [1]),
+            ('assert os.environ.items() == []', [1]),
+            ('assert os.environ.copy() == {}', [1]),
+            ("env = os.environ.copy()\nassert 'SECRET' not in env", [2]),
+            ("env = {**os.environ}\nassert 'SECRET' not in env", [2]),
+            ("env = _prescan_env().copy()\nassert 'SECRET' not in env", [2]),
+            ("env = os.environ\nassert env.get('SECRET') is None", [2]),
+            ("env = os.environ\nassert env['SECRET'] == 'ok'", []),
         ],
     )
-    def it_flags_only_whole_environment_assertions(self, source: str) -> None:
-        expected = [] if "env['SECRET'] ==" in source else [3 if 'if True:' in source else 2 if '\n' in source else 1]
+    def it_flags_only_whole_environment_assertions(self, source: str, expected: list[int]) -> None:
         assert _unsafe_assertions_in_source(source) == expected
 
     def it_skips_unparseable_embedded_text(self) -> None:
@@ -44,7 +53,7 @@ class DescribeEnvironmentAssertionChecker:
 
 def _is_environment_source(node: ast.expr, names: set[str]) -> bool:
     if isinstance(node, ast.Name):
-        return node.id in names or node.id == 'captured_env'
+        return node.id in names
     if isinstance(node, ast.Attribute):
         return isinstance(node.value, ast.Name) and node.value.id == 'os' and node.attr == 'environ'
     if isinstance(node, ast.Subscript):
@@ -56,12 +65,32 @@ def _is_environment_source(node: ast.expr, names: set[str]) -> bool:
                 or (isinstance(node.value, ast.Attribute) and node.value.attr == 'kwargs')
             )
         )
+    if isinstance(node, ast.Dict):
+        return any(
+            key is None and _is_environment_source(value, names)
+            for key, value in zip(node.keys, node.values, strict=True)
+        )
     if isinstance(node, ast.Call):
-        return isinstance(node.func, ast.Name) and (
-            (node.func.id == 'dict' and len(node.args) == 1 and _is_environment_source(node.args[0], names))
-            or node.func.id == '_prescan_env'
+        return (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr in {'get', 'keys', 'values', 'items', 'copy'}
+            and _is_environment_source(node.func.value, names)
+        ) or (
+            isinstance(node.func, ast.Name)
+            and (
+                (node.func.id == 'dict' and len(node.args) == 1 and _is_environment_source(node.args[0], names))
+                or node.func.id == '_prescan_env'
+            )
         )
     return False
+
+
+def _is_environment_alias(node: ast.expr, names: set[str]) -> bool:
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        return node.func.attr == 'copy' and _is_environment_source(node.func.value, names)
+    return _is_environment_source(node, names) and not (
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    )
 
 
 def _assertion_operands(expression: ast.expr) -> list[ast.expr]:
@@ -72,8 +101,8 @@ def _assertion_operands(expression: ast.expr) -> list[ast.expr]:
         elif isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name) and node.func.id == 'len':
                 operands.extend(node.args)
-            elif isinstance(node.func, ast.Attribute) and node.func.attr == 'items':
-                operands.append(node.func.value)
+            elif isinstance(node.func, ast.Attribute) and node.func.attr in {'get', 'keys', 'values', 'items', 'copy'}:
+                operands.append(node)
     if isinstance(expression, (ast.Name, ast.Attribute, ast.Subscript)):
         operands.append(expression)
     return operands
@@ -106,7 +135,7 @@ def _scan_assertions(statements: list[ast.stmt], names: set[str], offset: int = 
                 unsafe.extend(_scan_assertions(body, names, offset))
         elif isinstance(statement, (ast.Assign, ast.AnnAssign)) and statement.value is not None:
             for name in _assigned_names(statement):
-                if _is_environment_source(statement.value, names):
+                if _is_environment_alias(statement.value, names):
                     names.add(name)
                 else:
                     names.discard(name)

@@ -226,7 +226,7 @@ class DescribeRunTestsWithCoverageXdistStripping:
             _run_tests_with_coverage([], tmp_path)
 
         env = run.call_args.kwargs['env']
-        sentinel = env['GREMLIN_SENTINEL']
+        sentinel = env.get('GREMLIN_SENTINEL')
         has_coverage_core = 'COVERAGE_CORE' in env
         del env  # --showlocals must not display the subprocess environment.
         assert sentinel == 'kept'
@@ -254,7 +254,7 @@ class DescribePrescanEnv:
 
         env = _prescan_env()
 
-        kept = env['PYTEST_ADDOPTS']
+        kept = env.get('PYTEST_ADDOPTS')
         del env
         assert kept == '--import-mode=importlib -ra'
 
@@ -264,7 +264,7 @@ class DescribePrescanEnv:
 
         env = _prescan_env()
 
-        sentinel = env['GREMLIN_SENTINEL']
+        sentinel = env.get('GREMLIN_SENTINEL')
         has_addopts = 'PYTEST_ADDOPTS' in env
         del env  # --showlocals must not display the subprocess environment.
         assert sentinel == 'kept'
