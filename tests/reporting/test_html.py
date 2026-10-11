@@ -91,6 +91,21 @@ class DescribeHtmlReporterContent:
         assert '&lt;script&gt;alert(1)&lt;/script&gt;.py' in html
         assert 'failed &lt;script&gt;alert(2)&lt;/script&gt;' in html
 
+    @pytest.mark.parametrize('skipped_files', [None, {}])
+    def it_omits_skipped_section_when_none_were_skipped(self, skipped_files: dict[str, str] | None) -> None:
+        html = HtmlReporter().to_html(MutationScore.from_results([]), skipped_files=skipped_files)
+
+        assert 'Files skipped and not mutation tested' not in html
+
+    def it_renders_skipped_section_with_existing_html_escaping(self) -> None:
+        reporter = HtmlReporter()
+        skipped = {'a<&".py': 'failed <&"'}
+
+        assert reporter._render_skipped_section(skipped) == (
+            '<section aria-label="Skipped files"><h2>Files skipped and not mutation tested</h2>'
+            '<ul><li>a&lt;&amp;&quot;.py: failed &lt;&amp;&quot;</li></ul></section>'
+        )
+
     def it_includes_title(self, make_result):
         results = [make_result(GremlinResultStatus.ZAPPED)]
         score = MutationScore.from_results(results)

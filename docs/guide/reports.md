@@ -295,7 +295,7 @@ The directory is created automatically if it does not exist.
     }
   },
   "skipped_files": {
-    "src/broken.py": "could not instrument (RecursionError: maximum recursion depth exceeded)"
+    "src/broken.py": "RecursionError: maximum recursion depth exceeded"
   },
   "results": [
     {
@@ -358,8 +358,9 @@ A mapping of file paths to per-file statistics:
 **Skipped Files Object (`skipped_files`):**
 
 Present only when a source file could not be instrumented. It maps each skipped path to the
-reason; these files are not counted in `summary` or `files`. The HTML report also lists them
-above the charts, so a high mutation score is not mistaken for full source coverage.
+reason in the form `ExceptionType: message`; these files are not counted in `summary` or `files`.
+The HTML report also lists them above the charts, so a high mutation score is not mistaken
+for full source coverage.
 
 **Results Array (Gremlin Objects):**
 

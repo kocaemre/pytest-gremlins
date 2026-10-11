@@ -61,7 +61,7 @@ def _skip_message_count(result: pytest.RunResult) -> int:
 class DescribeSkippedFileReport:
     """A file that fails to instrument is named on the terminal with the reason."""
 
-    def it_records_skipped_files_in_json_and_html_when_other_files_mutate(
+    def it_records_skipped_files_in_json_when_other_files_mutate(
         self, pytester: pytest.Pytester, run_pytest_isolated: RunPytestIsolated
     ) -> None:
         _write_project(pytester, with_age=True)
@@ -73,10 +73,17 @@ class DescribeSkippedFileReport:
         result.stdout.fnmatch_lines(['*Zapped: * gremlins*'])
         report = json.loads(pytester.path.joinpath('coverage/gremlins/gremlins.json').read_text())
         assert report['summary']['total'] > 0
-        assert len(report['skipped_files']) == 1
-        skipped_path, reason = next(iter(report['skipped_files'].items()))
-        assert skipped_path.endswith('chain.py')
-        assert 'RecursionError' in reason
+        assert list(report['skipped_files']) == [str(pytester.path / 'src/demo/chain.py')]
+        assert 'RecursionError' in report['skipped_files'][str(pytester.path / 'src/demo/chain.py')]
+
+    def it_records_skipped_files_in_html_when_other_files_mutate(
+        self, pytester: pytest.Pytester, run_pytest_isolated: RunPytestIsolated
+    ) -> None:
+        _write_project(pytester, with_age=True)
+
+        result = run_pytest_isolated(pytester, '--gremlins', '--gremlin-targets', 'src/demo', '--gremlin-report=html')
+
+        result.stdout.fnmatch_lines(['*Zapped: * gremlins*'])
         html = pytester.path.joinpath('coverage/gremlins/index.html').read_text()
         assert 'Files skipped and not mutation tested' in html
         assert 'chain.py' in html

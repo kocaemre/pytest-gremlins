@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import logging
-from html import escape
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -106,13 +105,7 @@ class HtmlReporter:
         """
         chart_data = self._build_chart_data(score)
         history_html = self._render_history_section(history) if history is not None else ''
-        skipped_html = ''
-        if skipped_files:
-            rows = ''.join(f'<li>{escape(path)}: {escape(reason)}</li>' for path, reason in skipped_files.items())
-            skipped_html = (
-                '<section aria-label="Skipped files"><h2>Files skipped and not mutation tested</h2>'
-                f'<ul>{rows}</ul></section>'
-            )
+        skipped_html = self._render_skipped_section(skipped_files)
         return f"""<!DOCTYPE html>
 <html lang="en" data-theme="dark">
 <head>
@@ -738,6 +731,18 @@ class HtmlReporter:
             </div>
         </div>
         """
+
+    def _render_skipped_section(self, skipped_files: dict[str, str] | None) -> str:
+        """Render escaped paths and reasons for files that could not be instrumented."""
+        if not skipped_files:
+            return ''
+        rows = ''.join(
+            f'<li>{self._escape_html(path)}: {self._escape_html(reason)}</li>' for path, reason in skipped_files.items()
+        )
+        return (
+            '<section aria-label="Skipped files"><h2>Files skipped and not mutation tested</h2>'
+            f'<ul>{rows}</ul></section>'
+        )
 
     def _render_pardoned_section(self, score: MutationScore) -> str:
         """Render a table of pardoned gremlins with their pardon reasons.
