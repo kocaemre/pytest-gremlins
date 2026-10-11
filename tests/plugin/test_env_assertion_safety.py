@@ -20,10 +20,11 @@ class DescribeEnvironmentAssertionChecker:
             "assert kwargs['env'] == {}",
             'env = _prescan_env()\nassert env == {}',
             "env = dict(os.environ)\nassert env['SECRET'] == 'ok'",
+            "env = dict(os.environ)\nif True:\n    assert 'SECRET' not in env",
         ],
     )
     def it_flags_only_whole_environment_assertions(self, source: str) -> None:
-        expected = [] if "env['SECRET'] ==" in source else [2 if '\n' in source else 1]
+        expected = [] if "env['SECRET'] ==" in source else [3 if 'if True:' in source else 2 if '\n' in source else 1]
         assert _unsafe_assertions_in_source(source) == expected
 
     def it_skips_unparseable_embedded_text(self) -> None:
@@ -83,11 +84,26 @@ def _assigned_names(statement: ast.Assign | ast.AnnAssign) -> list[str]:
     return [target.id for target in targets if isinstance(target, ast.Name)]
 
 
+def _nested_statement_bodies(statement: ast.stmt) -> list[list[ast.stmt]]:
+    if not isinstance(statement, (ast.If, ast.For, ast.While, ast.With, ast.Try)):
+        return []
+    bodies = [statement.body]
+    if isinstance(statement, (ast.If, ast.For, ast.While, ast.Try)):
+        bodies.append(statement.orelse)
+    if isinstance(statement, ast.Try):
+        bodies.append(statement.finalbody)
+        bodies.extend(handler.body for handler in statement.handlers)
+    return bodies
+
+
 def _scan_assertions(statements: list[ast.stmt], names: set[str], offset: int = 0) -> list[int]:
     unsafe: list[int] = []
     for statement in statements:
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             unsafe.extend(_scan_assertions(statement.body, set(names), offset))
+        elif _nested_statement_bodies(statement):
+            for body in _nested_statement_bodies(statement):
+                unsafe.extend(_scan_assertions(body, names, offset))
         elif isinstance(statement, (ast.Assign, ast.AnnAssign)) and statement.value is not None:
             for name in _assigned_names(statement):
                 if _is_environment_source(statement.value, names):
