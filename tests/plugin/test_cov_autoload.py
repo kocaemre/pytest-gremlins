@@ -2,7 +2,30 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from unittest.mock import MagicMock
+
 import pytest
+
+from pytest_gremlins.plugin import _get_session, pytest_configure
+
+
+@pytest.mark.medium
+class DescribeCovRegistration:
+    """Track the parent's loaded plugin, not merely its installation."""
+
+    def it_records_an_explicitly_registered_cov_plugin(self, tmp_path: Path, make_pytest_config: object) -> None:
+        """The same parent-session flag is passed to gremlin subprocesses."""
+        manager = MagicMock()
+        manager.hasplugin.side_effect = lambda name: name == 'pytest_cov'
+        manager.get_plugin.return_value = None
+        config = make_pytest_config(tmp_path, pluginmanager=manager)  # type: ignore[operator]
+
+        pytest_configure(config)  # type: ignore[arg-type]
+
+        session = _get_session()
+        assert session is not None
+        assert session.pytest_cov_loaded is True
 
 
 @pytest.mark.medium

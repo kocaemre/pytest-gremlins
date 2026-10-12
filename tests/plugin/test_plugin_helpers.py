@@ -374,6 +374,23 @@ class DescribeBuildTestCommand:
 
         assert '--no-cov' not in result
 
+    def it_explicitly_loads_cov_when_autoload_is_disabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A loaded parent plugin must also register its flag in the child."""
+        monkeypatch.setenv('PYTEST_DISABLE_PLUGIN_AUTOLOAD', '1')
+
+        result = _build_test_command(None, pytest_cov_loaded=True)
+
+        assert result[-3:] == ['-p', 'pytest_cov', '--no-cov']
+
+    def it_does_not_load_cov_when_parent_lacks_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The child's disabled autoload must not become an implicit opt-in."""
+        monkeypatch.setenv('PYTEST_DISABLE_PLUGIN_AUTOLOAD', '1')
+
+        result = _build_test_command(None)
+
+        assert 'pytest_cov' not in result
+        assert '--no-cov' not in result
+
 
 @pytest.mark.medium
 class DescribeBuildTestCommandFileIO:
