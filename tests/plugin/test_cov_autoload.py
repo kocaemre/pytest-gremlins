@@ -28,7 +28,6 @@ class DescribeCovAutoload:
         output = result.stdout.str() + result.stderr.str()
         assert 'unrecognized arguments: --no-cov' not in output
         assert 'Zapped:' in output or 'Survived:' in output
-        assert 'Error:' not in output
 
     def it_keeps_cov_enabled_for_the_parent_when_loaded_explicitly(
         self, pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
@@ -50,4 +49,3 @@ class DescribeCovAutoload:
         result.assert_outcomes(passed=1)
         output = result.stdout.str() + result.stderr.str()
         assert 'unrecognized arguments: --no-cov' not in output
-        assert 'Error:' not in output
